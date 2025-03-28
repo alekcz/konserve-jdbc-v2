@@ -4,15 +4,20 @@
         io.replikativ/konserve {:mvn/version "0.7.319"}
         io.replikativ/superv.async {:mvn/version "0.3.46"}
         org.clojure/clojure {:mvn/version "1.11.1"}
-        com.github.seancorfield/next.jdbc {:mvn/version "1.3.874"}
-        com.mchange/c3p0 {:mvn/version"0.9.5.5"}}
+        com.github.seancorfield/next.jdbc {:mvn/version "1.3.1002"}
+        com.zaxxer/HikariCP {:mvn/version "6.3.0"}
+        bsless/clj-fast {:mvn/version "0.0.11"}}
  :aliases {:dev {:extra-paths ["test"]
+                 :jvm-opts ["-Djdk.attach.allowAttachSelf"]
                  :extra-deps {com.h2database/h2 {:mvn/version "2.1.214"}
                               com.microsoft.sqlserver/mssql-jdbc {:mvn/version "9.4.1.jre11"}
                               mysql/mysql-connector-java {:mvn/version "8.0.25"}
                               org.apache.derby/derby {:mvn/version "10.16.1.1"}
-                              org.postgresql/postgresql {:mvn/version "42.6.0"}
-                              org.xerial/sqlite-jdbc {:mvn/version "3.41.2.2"}}}
+                              org.postgresql/postgresql {:mvn/version "42.7.5"}
+                              org.xerial/sqlite-jdbc {:mvn/version "3.41.2.2"}
+                              io.replikativ/datahike-jdbc {:mvn/version "0.3.49" :exclusions [io.replikativ/konserve-jdbc]}
+                              io.replikativ/datahike {:mvn/version "0.6.1594"}
+                              com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.1"}}}
            :test {:extra-deps {lambdaisland/kaocha {:mvn/version "1.83.1314"}}}
            :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
                     :main-opts ["-m" "cljfmt.main" "check"]}

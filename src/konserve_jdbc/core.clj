@@ -12,9 +12,12 @@
             [next.jdbc.connection :as connection]
             [taoensso.timbre :refer [warn debug] :as timbre]
             [hasch.core :as hasch]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [clojure.core.reducers :as r]
+            [clojure.core.cache.wrapped :as w]
+            [clj-fast.core :as fast])
   (:import [java.sql Blob]
-           [com.mchange.v2.c3p0 ComboPooledDataSource PooledDataSource]
+           (com.zaxxer.hikari HikariDataSource)
            (java.io ByteArrayInputStream)
            (java.sql Connection)))
 
@@ -37,10 +40,10 @@
         conn (get @pool id)]
     (if-not (nil? conn)
       conn
-      (let [conns ^PooledDataSource (connection/->pool ComboPooledDataSource db-spec)
-            shutdown (fn [] (.close ^PooledDataSource conns))]
+      (let [conns ^HikariDataSource (connection/->pool HikariDataSource db-spec)
+            shutdown (fn [] (.close ^HikariDataSource conns))]
         (swap! pool assoc id conns)
-        (.close (jdbc/get-connection conns))
+        ;; (.close (jdbc/get-connection conns))
         (.addShutdownHook (Runtime/getRuntime)
                           (Thread. ^Runnable shutdown))
         conns))))
@@ -136,27 +139,40 @@
           "END;")]
     [(str "DROP TABLE IF EXISTS " table)]))
 
+(defn list-keys-opts [db-type]
+  (let [base {:builder-fn rs/as-unqualified-lower-maps}]
+    (case db-type
+      "postgresql" (assoc base :fetch-size 1000 :concurrency :read-only, :cursors :close, :result-type :forward-only)
+      base)))
+
 (defn change-row-id [connection table from to]
-  (jdbc/execute! connection
-                 ["UPDATE " table " SET id = '" to "' WHERE id = '" from "';"]))
+  (jdbc/with-transaction [tx connection]
+    (jdbc/execute-one! tx
+                       ["UPDATE " table " SET id = '" to "' WHERE id = '" from "';"])))
 
 (defn read-field [db-type connection table id column & {:keys [binary? locked-cb] :or {binary? false}}]
-  (let [res (-> (jdbc/execute! connection
-                               [(str "SELECT id," (name column) " FROM " table " WHERE id = '" id "';")]
-                               {:builder-fn rs/as-unqualified-lower-maps})
-                first
-                column)]
-    (if binary?
-      (locked-cb {:input-stream (when res (ByteArrayInputStream. (extract-bytes res db-type)))
-                  :size nil})
-      (extract-bytes res db-type))))
+  (jdbc/with-transaction [tx connection]
+    (let [res (fast/val-at (jdbc/execute-one! tx
+                                 [(str "SELECT id," (name column) " FROM " table " WHERE id = '" id "';")]
+                                 {:builder-fn rs/as-unqualified-lower-maps})
+                  column)]
+      (if binary?
+        (locked-cb {:input-stream (when res (ByteArrayInputStream. (extract-bytes res db-type)))
+                    :size nil})
+        (extract-bytes res db-type)))))
+
+(defn read-given [db-type given]
+  {:id (:id given)
+   :header (extract-bytes (:header given) db-type)
+   :meta (extract-bytes (:meta given) db-type)
+   :val (extract-bytes (:val given) db-type)})
 
 (defn read-all [db-type connection table id]
-  (let [res (-> (jdbc/execute! connection
-                               [(str "SELECT id, header, meta, val FROM " table " WHERE id = '" id "';")]
-                               {:builder-fn rs/as-unqualified-lower-maps})
-                first)]
-    (into {} (for [[k v] res] [k (if (= k :id) v (extract-bytes v db-type))]))))
+  (jdbc/with-transaction [tx connection]
+    (let [res (jdbc/execute-one! tx
+                                 [(str "SELECT id, header, meta, val FROM " table " WHERE id = '" id "';")]
+                                 {:builder-fn rs/as-unqualified-lower-maps})]
+      (read-given db-type res))))
 
 (extend-protocol PBackingLock
   Boolean
@@ -170,7 +186,8 @@
                 (go-try- (let [{:keys [header meta value]} @data]
                            (if (and header meta value)
                              (let [ps (update-statement (:dbtype (:db-spec table)) (:table table) key header meta value)]
-                               (jdbc/execute-one! (:connection table) ps))
+                               (jdbc/with-transaction [tx (:connection table)]
+                                 (jdbc/execute-one! tx ps)))
                              (throw (ex-info "Updating a row is only possible if header, meta and value are set." {:data @data})))
                            (reset! data {})))))
   (-close [_ env]
@@ -180,49 +197,56 @@
   (-read-header [_ env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
-                 (when-not @cache
-                   (reset! cache (read-all (:dbtype (:db-spec table)) (:connection table) (:table table) key)))
-                 (-> @cache :header))))
+                 (let [tbl-cache (w/lookup (:table-cache table) key)]
+                    (cond 
+                      tbl-cache (reset! cache tbl-cache)
+                      (not @cache) (reset! cache (read-all (:dbtype (:db-spec table)) (:connection table) (:table table) key))
+                      :else nil)
+                    (w/through-cache (:table-cache table) key (constantly @cache))
+                    (-> @cache :header)))))
   (-read-meta [_ _meta-size env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (-> @cache :meta))))
+                (go-try- (fast/val-at @cache :meta))))
   (-read-value [_ _meta-size env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (-> @cache :val))))
+                (go-try- (fast/val-at @cache :val))))
   (-read-binary [_ _meta-size locked-cb env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (locked-cb {:input-stream (when (-> @cache :val) (ByteArrayInputStream. (-> @cache :val)))
                                      :size nil}))))
   (-write-header [_ header env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (swap! data assoc :header header))))
+                (go-try- (swap! data fast/fast-assoc :header header))))
   (-write-meta [_ meta env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (swap! data assoc :meta meta))))
+                (go-try- (swap! data fast/fast-assoc :meta meta))))
   (-write-value [_ value _meta-size env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (swap! data assoc :value value))))
+                (go-try- (swap! data fast/fast-assoc :value value))))
   (-write-binary [_ _meta-size blob env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (swap! data assoc :value blob)))))
+                (go-try- (swap! data fast/fast-assoc :value blob)))))
 
-(defrecord JDBCTable [db-spec connection table]
+(defrecord JDBCTable [db-spec connection table table-cache]
   PBackingStore
   (-create-blob [this store-key env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (JDBCRow. this store-key (atom {}) (atom nil)))))
+                (go-try- (JDBCRow. this store-key (atom {}) (atom (w/lookup-or-miss table-cache store-key (constantly nil)))))))
   (-delete-blob [_ store-key env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (jdbc/execute! connection
-                                        [(str "DELETE FROM " table " WHERE id = '" store-key "';")]))))
+                (go-try- (jdbc/with-transaction [tx connection]
+                           (jdbc/execute-one! tx
+                                              [(str "DELETE FROM " table " WHERE id = '" store-key "';")])
+                           (w/evict table-cache store-key)))))
   (-blob-exists? [_ store-key env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (let [res (jdbc/execute! connection
+                (go-try- (let [res (jdbc/execute-one! connection
                                                   [(str "SELECT 1 FROM " table " WHERE id = '" store-key "';")])]
-                           (not (nil? (first res)))))))
+                           (not (nil? res))))))
   (-copy [_ from to env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (jdbc/execute! connection (copy-row-statement (:dbtype db-spec) table to from)))))
+                (go-try- (jdbc/with-transaction [tx connection]
+                           (jdbc/execute! tx (copy-row-statement (:dbtype db-spec) table to from))))))
   (-atomic-move [_ from to env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (change-row-id connection table from to))))
@@ -239,31 +263,51 @@
                   ;; Testing for existence in other ways is not worth the effort as it is specific to the db setup 
                   ;; not just the type
                  (let [res (try
-                             (jdbc/execute! connection [(str "select 1 from " table " limit 1")])
+                             (jdbc/execute-one! connection [(str "select 1 from " table " limit 1")])
                              (catch Exception _e
                                (debug (str "Table " table " does not exist. Attempting to create it."))
                                nil))]
                    (when (nil? res)
-                     (jdbc/execute! connection (create-statement (:dbtype db-spec) table)))))))
+                     (jdbc/with-transaction [tx connection]
+                       (jdbc/execute-one! tx (create-statement (:dbtype db-spec) table))))))))
   (-sync-store [_ env]
     (if (:sync? env) nil (go-try- nil)))
   (-delete-store [_ env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (jdbc/execute! connection (delete-statement (:dbtype db-spec) table))
-                         (.close ^Connection connection))))
-  (-keys [_ env]
+                (go-try- (jdbc/with-transaction [tx connection]
+                           (jdbc/execute-one! tx (delete-statement (:dbtype db-spec) table))))))
+  (-keys [this env]
     (async+sync (:sync? env) *default-sync-translation*
-                (go-try- (let [res' (jdbc/execute! connection
-                                                   [(str "SELECT id FROM " table ";")]
-                                                   {:builder-fn rs/as-unqualified-lower-maps})]
-                           (map :id res'))))))
+                (go-try-
+                 (let [opts  (list-keys-opts (:dbtype db-spec))]
+                   (jdbc/with-transaction [tx connection opts]
+                     (let [start (System/currentTimeMillis)
+                           res (r/foldcat
+                                  (r/map
+                                    (fn [row]
+                                      (let [id (get row :id)]
+                                        (w/through-cache table-cache 
+                                                        id 
+                                                        (constantly 
+                                                          (read-given (:dbtype db-spec) row)))
+                                        id))
+                                    ;; :id
+                                  (jdbc/plan tx [(str "SELECT * FROM " table ";")] opts)))]
+                      (timbre/info "keys" (- (System/currentTimeMillis) start) "ms")
+                       res)))))))
+
+(defn map-username [db-spec]
+  ;; for HikariCP
+  (if (and (contains? db-spec :user) (not (contains? db-spec :username)))
+    (assoc db-spec :username (:user db-spec))
+    db-spec))
 
 (defn- prepare-spec [db]
   ;; next.jdbc does not officially support the credentials in the format: driver://user:password@host/db
   ;; connection/uri->db-spec makes is possible but is rough around the edges
   ;; https://github.com/seancorfield/next-jdbc/issues/229
   (if-not (contains? db :jdbcUrl)
-    db
+    (map-username db)
     (let [old-url (:jdbcUrl db)
           spec (connection/uri->db-spec old-url) ;; set port to -1 if none is in the url
           port (:port spec)
@@ -276,9 +320,9 @@
                                             :port))))
           final-jdbc-url (-> new-spec connection/jdbc-url)
           final-spec (assoc db :jdbcUrl final-jdbc-url :dbtype (:dbtype new-spec))]
-      final-spec)))
+      (map-username final-spec))))
 
-(defn connect-store [db-spec & {:keys [table opts]
+(defn connect-store [db-spec & {:keys [table opts cache-threshold]
                                 :as params}]
   (let [table (or table (:table db-spec) default-table)
         db-spec (prepare-spec db-spec)]
@@ -294,12 +338,14 @@
        (.put "com.mchange.v2.log.MLog" "com.mchange.v2.log.slf4j.Slf4jMLog"))) ;; using  Slf4j allows timbre to control logs.
 
     (let [complete-opts (merge {:sync? true} opts)
+          cache-threshold (or cache-threshold 100000) ;; this is a cache so we don't having to get the data one by one after getting the keys
           db-spec (if (:dbtype db-spec)
                     db-spec
                     (assoc db-spec :dbtype (:subprotocol db-spec)))
           db-spec (assoc db-spec :sync? (:sync? complete-opts))
-          ^PooledDataSource connection (get-connection db-spec)
-          backing (JDBCTable. db-spec connection table)
+          ^HikariDataSource connection (get-connection db-spec)
+          cache (w/fifo-cache-factory {} :threshold cache-threshold)
+          backing (JDBCTable. db-spec connection table cache)
           config (merge {:opts               complete-opts
                          :config             {:sync-blob? true
                                               :in-place? true
@@ -319,14 +365,14 @@
   [store env]
   (async+sync (:sync? env) *default-sync-translation*
               (go-try-
-               (.close ^PooledDataSource (:connection ^JDBCTable (:backing store)))
+               (.close ^HikariDataSource (:connection ^JDBCTable (:backing store)))
                (remove-from-pool (:db-spec ^JDBCTable (:backing store))))))
 
 (defn delete-store [db-spec & {:keys [table opts]}]
   (let [complete-opts (merge {:sync? true} opts)
         table (or table (:table db-spec) default-table)
-        connection (jdbc/get-connection (prepare-spec db-spec))
-        backing (JDBCTable. db-spec connection table)]
+        ^HikariDataSource connection (get-connection (prepare-spec db-spec))
+        backing (JDBCTable. db-spec connection table (w/fifo-cache-factory {}))]
     (-delete-store backing complete-opts)))
 
 (comment

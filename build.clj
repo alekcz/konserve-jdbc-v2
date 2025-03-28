@@ -5,10 +5,10 @@
             [deps-deploy.deps-deploy :as dd])
   (:import [clojure.lang ExceptionInfo]))
 
-(def org "replikativ")
-(def lib 'io.replikativ/konserve-jdbc)
+(def org "alekcz")
+(def lib 'alekcz/konserve-jdbc)
 (def current-commit (b/git-process {:git-args "rev-parse HEAD"}))
-(def version (format "0.2.%s" (b/git-count-revs nil)))
+(def version (format "0.2.%s-SNAPSHOT" (b/git-count-revs nil)))
 (def class-dir "target/classes")
 (def basis (b/create-basis {:project "deps.edn"}))
 (def jar-file (format "target/%s-%s.jar" (name lib) version))
