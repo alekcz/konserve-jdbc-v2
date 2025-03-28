@@ -43,7 +43,7 @@
       (let [conns ^HikariDataSource (connection/->pool HikariDataSource db-spec)
             shutdown (fn [] (.close ^HikariDataSource conns))]
         (swap! pool assoc id conns)
-        ;; (.close (jdbc/get-connection conns))
+        (.close (jdbc/get-connection conns))
         (.addShutdownHook (Runtime/getRuntime)
                           (Thread. ^Runnable shutdown))
         conns))))
@@ -203,7 +203,7 @@
                      (not @cache) (reset! cache (read-all (:dbtype (:db-spec table)) (:connection table) (:table table) key))
                      :else nil)
                    (w/through-cache (:table-cache table) key (constantly @cache))
-                   (-> @cache :header)))))
+                   (fast/val-at @cache :header)))))
   (-read-meta [_ _meta-size env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (fast/val-at @cache :meta))))
@@ -281,8 +281,7 @@
                 (go-try-
                  (let [opts  (list-keys-opts (:dbtype db-spec))]
                    (jdbc/with-transaction [tx connection opts]
-                     (let [start (System/currentTimeMillis)
-                           res (r/foldcat
+                     (let [res (r/foldcat
                                 (r/map
                                  (fn [row]
                                    (let [id (get row :id)]
@@ -292,7 +291,6 @@
                                                        (read-given (:dbtype db-spec) row)))
                                      id))
                                  (jdbc/plan tx [(str "SELECT * FROM " table ";")] opts)))]
-                       (timbre/info "keys" (- (System/currentTimeMillis) start) "ms")
                        res)))))))
 
 (defn map-username [db-spec]
@@ -331,11 +329,7 @@
     (when-not (supported-dbtypes (:dbtype db-spec))
       (warn "Unsupported database type " (:dbtype db-spec)
             " - full functionality of store is only guaranteed for following database types: "  supported-dbtypes))
-
-    (System/setProperties
-     (doto (java.util.Properties. (System/getProperties))
-       (.put "com.mchange.v2.log.MLog" "com.mchange.v2.log.slf4j.Slf4jMLog"))) ;; using  Slf4j allows timbre to control logs.
-
+            
     (let [complete-opts (merge {:sync? true} opts)
           cache-threshold (or cache-threshold 100000) ;; this is a cache so we don't having to get the data one by one after getting the keys
           db-spec (if (:dbtype db-spec)
