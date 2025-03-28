@@ -79,5 +79,6 @@
               :lib lib
               :version version
               :jar-file jar-file
-              :class-dir class-dir}))
+              :class-dir class-dir})
+  (println "Installed" lib version))
  

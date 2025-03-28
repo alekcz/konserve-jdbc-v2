@@ -153,9 +153,9 @@
 (defn read-field [db-type connection table id column & {:keys [binary? locked-cb] :or {binary? false}}]
   (jdbc/with-transaction [tx connection]
     (let [res (fast/val-at (jdbc/execute-one! tx
-                                 [(str "SELECT id," (name column) " FROM " table " WHERE id = '" id "';")]
-                                 {:builder-fn rs/as-unqualified-lower-maps})
-                  column)]
+                                              [(str "SELECT id," (name column) " FROM " table " WHERE id = '" id "';")]
+                                              {:builder-fn rs/as-unqualified-lower-maps})
+                           column)]
       (if binary?
         (locked-cb {:input-stream (when res (ByteArrayInputStream. (extract-bytes res db-type)))
                     :size nil})
@@ -198,12 +198,12 @@
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
                  (let [tbl-cache (w/lookup (:table-cache table) key)]
-                    (cond 
-                      tbl-cache (reset! cache tbl-cache)
-                      (not @cache) (reset! cache (read-all (:dbtype (:db-spec table)) (:connection table) (:table table) key))
-                      :else nil)
-                    (w/through-cache (:table-cache table) key (constantly @cache))
-                    (-> @cache :header)))))
+                   (cond
+                     tbl-cache (reset! cache tbl-cache)
+                     (not @cache) (reset! cache (read-all (:dbtype (:db-spec table)) (:connection table) (:table table) key))
+                     :else nil)
+                   (w/through-cache (:table-cache table) key (constantly @cache))
+                   (-> @cache :header)))))
   (-read-meta [_ _meta-size env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (fast/val-at @cache :meta))))
@@ -241,7 +241,7 @@
   (-blob-exists? [_ store-key env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try- (let [res (jdbc/execute-one! connection
-                                                  [(str "SELECT 1 FROM " table " WHERE id = '" store-key "';")])]
+                                                      [(str "SELECT 1 FROM " table " WHERE id = '" store-key "';")])]
                            (not (nil? res))))))
   (-copy [_ from to env]
     (async+sync (:sync? env) *default-sync-translation*
@@ -283,17 +283,16 @@
                    (jdbc/with-transaction [tx connection opts]
                      (let [start (System/currentTimeMillis)
                            res (r/foldcat
-                                  (r/map
-                                    (fn [row]
-                                      (let [id (get row :id)]
-                                        (w/through-cache table-cache 
-                                                        id 
-                                                        (constantly 
-                                                          (read-given (:dbtype db-spec) row)))
-                                        id))
-                                    ;; :id
-                                  (jdbc/plan tx [(str "SELECT * FROM " table ";")] opts)))]
-                      (timbre/info "keys" (- (System/currentTimeMillis) start) "ms")
+                                (r/map
+                                 (fn [row]
+                                   (let [id (get row :id)]
+                                     (w/through-cache table-cache
+                                                      id
+                                                      (constantly
+                                                       (read-given (:dbtype db-spec) row)))
+                                     id))
+                                 (jdbc/plan tx [(str "SELECT * FROM " table ";")] opts)))]
+                       (timbre/info "keys" (- (System/currentTimeMillis) start) "ms")
                        res)))))))
 
 (defn map-username [db-spec]
